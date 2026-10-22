@@ -9,12 +9,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/maks2134/telegram-rag-bot/internal/bot"
 	"github.com/maks2134/telegram-rag-bot/internal/config"
-	"github.com/maks2134/telegram-rag-bot/internal/llm"
-	"github.com/maks2134/telegram-rag-bot/internal/pipeline"
-	"github.com/maks2134/telegram-rag-bot/internal/store"
-	"github.com/maks2134/telegram-rag-bot/internal/web"
+	"github.com/maks2134/telegram-rag-bot/internal/delivery/telegram"
+	"github.com/maks2134/telegram-rag-bot/internal/delivery/web"
+	"github.com/maks2134/telegram-rag-bot/internal/infra/keyword"
+	"github.com/maks2134/telegram-rag-bot/internal/infra/llm"
+	"github.com/maks2134/telegram-rag-bot/internal/usecase"
 )
 
 func main() {
@@ -23,33 +23,34 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	kb := store.New()
+	kb := keyword.New()
 	if err := kb.LoadDir(cfg.DocsDir); err != nil {
 		log.Fatalf("docs: %v", err)
 	}
 	log.Printf("loaded %d docs from %s", len(kb.Docs()), cfg.DocsDir)
 
 	client := llm.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
-	asker := &pipeline.Asker{Store: kb, LLM: client}
+	asker := &usecase.Asker{Retriever: kb, Answerer: client}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           (&web.Server{Asker: asker, Store: kb, Model: cfg.LLMModel}).Handler(),
+		Handler:           (&web.Server{Service: asker, Catalog: kb, Model: cfg.LLMModel}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
 		log.Printf("web UI listening on http://localhost%s", cfg.Addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http: %v", err)
+			log.Printf("http: %v", err)
+			stop()
 		}
 	}()
 
 	if cfg.TelegramToken != "" {
-		tg, err := bot.NewTelegram(cfg.TelegramToken, asker, cfg.AdminChatID)
+		tg, err := telegram.NewTelegram(cfg.TelegramToken, asker, cfg.AdminChatID)
 		if err != nil {
 			log.Fatalf("telegram: %v", err)
 		}
@@ -65,6 +66,8 @@ func main() {
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown: %v", err)
+	}
 	log.Printf("shutdown complete")
 }

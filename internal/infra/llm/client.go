@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/maks2134/telegram-rag-bot/internal/store"
+	"github.com/maks2134/telegram-rag-bot/internal/domain"
 )
+
+const maxResponseBody = 1 << 20 // 1 MiB
 
 // Client talks to an OpenAI-compatible chat completions API.
 type Client struct {
@@ -64,7 +67,7 @@ type chatResponse struct {
 }
 
 // Answer asks the model to answer only from the given sources.
-func (c *Client) Answer(ctx context.Context, question string, sources []store.Source) (string, error) {
+func (c *Client) Answer(ctx context.Context, question string, sources []domain.Source) (string, error) {
 	var ctxBuilder strings.Builder
 	for i, s := range sources {
 		fmt.Fprintf(&ctxBuilder, "[%d] %s: %s\n", i+1, s.Title, s.Excerpt)
@@ -89,28 +92,29 @@ Do not invent numbers or policies missing from the excerpts.`
 		MaxTokens:   400,
 	})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("marshal chat request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("create chat request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("llm request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("read llm response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("llm http %d: %s", resp.StatusCode, truncate(string(raw), 400))
+		msg := truncate(string(raw), 400)
+		return "", fmt.Errorf("llm http %d: %w", resp.StatusCode, errors.New(msg))
 	}
 
 	var parsed chatResponse
@@ -118,7 +122,7 @@ Do not invent numbers or policies missing from the excerpts.`
 		return "", fmt.Errorf("decode llm response: %w", err)
 	}
 	if parsed.Error != nil && parsed.Error.Message != "" {
-		return "", fmt.Errorf("llm: %s", parsed.Error.Message)
+		return "", fmt.Errorf("llm: %w", errors.New(parsed.Error.Message))
 	}
 	if len(parsed.Choices) == 0 {
 		return "", fmt.Errorf("llm returned no choices")

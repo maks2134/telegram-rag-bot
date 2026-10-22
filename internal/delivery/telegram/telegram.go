@@ -1,4 +1,4 @@
-package bot
+package telegram
 
 import (
 	"context"
@@ -6,23 +6,29 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
-	"github.com/maks2134/telegram-rag-bot/internal/pipeline"
+	"github.com/maks2134/telegram-rag-bot/internal/domain"
 )
+
+// Service runs the RAG ask pipeline.
+type Service interface {
+	Ask(ctx context.Context, q string) domain.Result
+}
 
 // Telegram runs long-polling support bot handlers.
 type Telegram struct {
 	api         *tgbotapi.BotAPI
-	asker       *pipeline.Asker
+	svc         Service
 	adminChatID int64
 	mu          sync.Mutex
 	logs        []string
 }
 
 // NewTelegram creates a polling bot. token must be non-empty.
-func NewTelegram(token string, asker *pipeline.Asker, adminChatID int64) (*Telegram, error) {
+func NewTelegram(token string, svc Service, adminChatID int64) (*Telegram, error) {
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, err
@@ -30,7 +36,7 @@ func NewTelegram(token string, asker *pipeline.Asker, adminChatID int64) (*Teleg
 	api.Debug = false
 	return &Telegram{
 		api:         api,
-		asker:       asker,
+		svc:         svc,
 		adminChatID: adminChatID,
 	}, nil
 }
@@ -61,6 +67,25 @@ func (t *Telegram) Run(ctx context.Context) error {
 			t.handleMessage(ctx, update.Message)
 		}
 	}
+}
+
+// FormatTelegram builds a Telegram message with sources footer.
+func FormatTelegram(res domain.Result) string {
+	var b strings.Builder
+	b.WriteString(res.Answer)
+	if len(res.Sources) > 0 && !res.Refused {
+		b.WriteString("\n\nSources:")
+		seen := make(map[string]struct{})
+		for _, s := range res.Sources {
+			if _, ok := seen[s.Title]; ok {
+				continue
+			}
+			seen[s.Title] = struct{}{}
+			b.WriteString("\n• ")
+			b.WriteString(s.Title)
+		}
+	}
+	return b.String()
 }
 
 func mainKeyboard() tgbotapi.ReplyKeyboardMarkup {
@@ -130,13 +155,12 @@ func (t *Telegram) handleMessage(ctx context.Context, msg *tgbotapi.Message) {
 
 	switch {
 	case strings.HasPrefix(lower, "/start"):
-		welcome := "👋 *DocPilot* — docs-grounded support\n\n" +
+		welcome := "👋 DocPilot — docs-grounded support\n\n" +
 			"I answer only from your knowledge base and cite sources.\n\n" +
 			"Try a button below, or ask in your own words.\n" +
-			"Need a person\\? Tap *Talk to human* or /human\\.\n\n" +
-			"_Tip:_ /id shows your chat id for ADMIN\\_CHAT\\_ID\\."
+			"Need a person? Tap Talk to human or /human.\n\n" +
+			"Tip: /id shows your chat id for ADMIN_CHAT_ID."
 		out := tgbotapi.NewMessage(chatID, welcome)
-		out.ParseMode = "Markdown"
 		out.ReplyMarkup = mainKeyboard()
 		if _, err := t.api.Send(out); err != nil {
 			log.Printf("telegram send: %v", err)
@@ -166,8 +190,11 @@ func (t *Telegram) replyAsk(ctx context.Context, chatID int64, user, question st
 	typing := tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)
 	_, _ = t.api.Request(typing)
 
-	res := t.asker.Ask(ctx, question)
-	body := pipeline.FormatTelegram(res)
+	askCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+
+	res := t.svc.Ask(askCtx, question)
+	body := FormatTelegram(res)
 	out := tgbotapi.NewMessage(chatID, body)
 	out.ReplyMarkup = mainKeyboard()
 	if _, err := t.api.Send(out); err != nil {

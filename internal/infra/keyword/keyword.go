@@ -1,28 +1,18 @@
-package store
+package keyword
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/google/uuid"
+
+	"github.com/maks2134/telegram-rag-bot/internal/domain"
 )
-
-// Document is a loaded knowledge-base file.
-type Document struct {
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	Content string `json:"content"`
-}
-
-// Source is a retrieved excerpt with a relevance score.
-type Source struct {
-	Title   string `json:"title"`
-	Excerpt string `json:"excerpt"`
-	Score   int    `json:"score"`
-}
 
 type chunk struct {
 	DocID   string
@@ -31,29 +21,29 @@ type chunk struct {
 	Tokens  []string
 }
 
-// Store is an in-memory keyword retrieval index.
-type Store struct {
+// Index is an in-memory keyword retrieval index.
+type Index struct {
 	mu     sync.RWMutex
-	docs   []Document
+	docs   []domain.Document
 	chunks []chunk
 }
 
-// New returns an empty store.
-func New() *Store {
-	return &Store{}
+// New returns an empty index.
+func New() *Index {
+	return &Index{}
 }
 
 // Docs returns a copy of loaded documents.
-func (s *Store) Docs() []Document {
+func (s *Index) Docs() []domain.Document {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]Document, len(s.docs))
+	out := make([]domain.Document, len(s.docs))
 	copy(out, s.docs)
 	return out
 }
 
 // LoadDir indexes all *.md files under dir.
-func (s *Store) LoadDir(dir string) error {
+func (s *Index) LoadDir(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("read docs dir: %w", err)
@@ -77,7 +67,7 @@ func (s *Store) LoadDir(dir string) error {
 		if h := firstHeading(content); h != "" {
 			title = h
 		}
-		s.Add(Document{
+		s.Add(domain.Document{
 			ID:      uuid.NewString(),
 			Title:   title,
 			Content: content,
@@ -91,7 +81,7 @@ func (s *Store) LoadDir(dir string) error {
 }
 
 // Add chunks and indexes a document.
-func (s *Store) Add(d Document) {
+func (s *Index) Add(d domain.Document) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.docs = append(s.docs, d)
@@ -107,12 +97,10 @@ func (s *Store) Add(d Document) {
 
 func splitSentences(content string) []string {
 	content = strings.ReplaceAll(content, "\r\n", "\n")
-	// Normalize sentence boundaries so ".\n" still chunks.
 	content = strings.ReplaceAll(content, ".\n", ". ")
 	var out []string
 	for _, part := range strings.Split(content, ". ") {
-		part = strings.TrimSpace(part)
-		part = strings.TrimLeft(part, "# ")
+		part = trimMarkdownHeading(strings.TrimSpace(part))
 		if part == "" {
 			continue
 		}
@@ -121,11 +109,27 @@ func splitSentences(content string) []string {
 	return out
 }
 
+func trimMarkdownHeading(s string) string {
+	s = strings.TrimSpace(s)
+	for strings.HasPrefix(s, "## ") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, "## "))
+	}
+	for strings.HasPrefix(s, "# ") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, "# "))
+	}
+	return s
+}
+
 // Retrieve returns the top-k keyword-matched sources.
-func (s *Store) Retrieve(question string, k int) []Source {
+func (s *Index) Retrieve(question string, k int) []domain.Source {
 	qTokens := tokenize(question)
+	qSet := make(map[string]struct{}, len(qTokens))
+	for _, qt := range qTokens {
+		qSet[qt] = struct{}{}
+	}
+
 	type scored struct {
-		src   Source
+		src   domain.Source
 		score int
 	}
 	var ranked []scored
@@ -135,16 +139,14 @@ func (s *Store) Retrieve(question string, k int) []Source {
 
 	for _, c := range s.chunks {
 		score := 0
-		for _, qt := range qTokens {
-			for _, ct := range c.Tokens {
-				if qt == ct {
-					score++
-				}
+		for _, ct := range c.Tokens {
+			if _, ok := qSet[ct]; ok {
+				score++
 			}
 		}
 		if score > 0 {
 			ranked = append(ranked, scored{
-				src: Source{
+				src: domain.Source{
 					Title:   c.Title,
 					Excerpt: c.Content,
 					Score:   score,
@@ -154,20 +156,14 @@ func (s *Store) Retrieve(question string, k int) []Source {
 		}
 	}
 
-	for i := 0; i < len(ranked); i++ {
-		best := i
-		for j := i + 1; j < len(ranked); j++ {
-			if ranked[j].score > ranked[best].score {
-				best = j
-			}
-		}
-		ranked[i], ranked[best] = ranked[best], ranked[i]
-	}
+	slices.SortFunc(ranked, func(a, b scored) int {
+		return cmp.Compare(b.score, a.score)
+	})
 
 	if k > len(ranked) {
 		k = len(ranked)
 	}
-	out := make([]Source, 0, k)
+	out := make([]domain.Source, 0, k)
 	for i := 0; i < k; i++ {
 		out = append(out, ranked[i].src)
 	}

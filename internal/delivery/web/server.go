@@ -1,19 +1,29 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
 
-	"github.com/maks2134/telegram-rag-bot/internal/pipeline"
-	"github.com/maks2134/telegram-rag-bot/internal/store"
+	"github.com/maks2134/telegram-rag-bot/internal/domain"
 )
+
+// Service runs the RAG ask pipeline.
+type Service interface {
+	Ask(ctx context.Context, q string) domain.Result
+}
+
+// Catalog lists loaded knowledge-base documents.
+type Catalog interface {
+	Docs() []domain.Document
+}
 
 // Server exposes health, ask, docs list, and the Trace UI.
 type Server struct {
-	Asker *pipeline.Asker
-	Store *store.Store
-	Model string
+	Service Service
+	Catalog Catalog
+	Model   string
 }
 
 // Handler returns the HTTP mux.
@@ -31,7 +41,7 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) listDocs(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, s.Store.Docs())
+	writeJSON(w, s.Catalog.Docs())
 }
 
 func (s *Server) ask(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +57,7 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "question required", http.StatusBadRequest)
 		return
 	}
-	res := s.Asker.Ask(r.Context(), req.Question)
+	res := s.Service.Ask(r.Context(), req.Question)
 	writeJSON(w, res)
 }
 

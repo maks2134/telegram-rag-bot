@@ -4,10 +4,20 @@
 
 ## Stack
 
-- Go 1.22+
+- Go 1.26+
+- Clean Architecture: `domain` → `usecase` (ports) → `infra/*` + `delivery/*`
 - Telegram Bot API (long polling locally; webhook notes below)
 - OpenAI-compatible LLM (DeepSeek by default; OpenAI / Ollama via env)
 - In-memory keyword retrieval over `./docs/*.md` (swap for embeddings + pgvector later)
+
+```
+cmd/bot                 composition root
+internal/domain         Document, Source, Result
+internal/usecase        Ask + Retriever/Answerer ports
+internal/infra/keyword  keyword index
+internal/infra/llm      OpenAI-compatible client
+internal/delivery/*     Telegram + web Trace UI
+```
 
 ## Run
 
